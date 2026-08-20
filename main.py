@@ -1,12 +1,12 @@
 import hashlib
 import json
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, HTTPException, Response, status
+from fastapi import FastAPI, Response
 from pydantic import BaseModel, Field
 
 app = FastAPI(title="BQML Experiment Gate")
 
-# Stateful storage mock (in production, use Redis or a database)
 STORAGE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -25,8 +25,22 @@ class BQMLRequest(BaseModel):
     maxBytes: Optional[int] = 2000
 
 
+def parse_utc_time(time_str: str) -> datetime:
+    """Parses various ISO8601 string formats into a UTC datetime object."""
+    if not time_str:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    # Handle Z suffix
+    if time_str.endswith("Z"):
+        time_str = time_str[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(time_str).astimezone(timezone.utc)
+    except Exception:
+        # Fallback string comparison if parsing fails
+        return time_str
+
+
 @app.post("/bqml")
-async def handle_bqml(payload: BQMLRequest, response: Response):
+async def handle_bqml(payload: BQMLRequest):
     phase = payload.phase
     run_id = payload.runId
 
@@ -43,17 +57,21 @@ async def handle_bqml(payload: BQMLRequest, response: Response):
     if phase == "select":
         reason_codes = []
 
-        # Check trial limits
         if payload.trials and len(payload.trials) > (payload.numTrialsLimit or 10):
             reason_codes.append("TRIAL_LIMIT_EXCEEDED")
 
         # Deduplicate rows by [entity, UTC(eventTime)]
-        # Keep highest integer version, then UTF-8-byte-smallest ID
         dedup_map = {}
         for row in payload.rows or []:
-            key = (row.get("entity"), row.get("eventTime"))
+            entity = row.get("entity", "")
+            raw_event_time = row.get("eventTime", "")
+            # Normalize eventTime to UTC representation for grouping
+            utc_event_key = parse_utc_time(raw_event_time)
+            
+            key = (entity, utc_event_key)
             ver = row.get("version", 1)
             rid = row.get("id", "")
+
             if key not in dedup_map:
                 dedup_map[key] = row
             else:
@@ -64,6 +82,7 @@ async def handle_bqml(payload: BQMLRequest, response: Response):
                     dedup_map[key] = row
 
         retained_rows = list(dedup_map.values())
+
         train_row_ids = sorted(
             [r["id"] for r in retained_rows if r.get("split") == "TRAIN"],
             key=lambda x: x.encode("utf-8"),
@@ -73,43 +92,51 @@ async def handle_bqml(payload: BQMLRequest, response: Response):
             key=lambda x: x.encode("utf-8"),
         )
 
-        # Feature eligibility check
+        # Feature Eligibility Checks
         all_feature_names = set()
         for r in retained_rows:
-            for fname, fval in r.get("features", {}).items():
+            for fname in r.get("features", {}).keys():
                 all_feature_names.add(fname)
 
         eligible_features = []
+        forbidden_set = set(payload.forbiddenFeatures or [])
+
         for fname in sorted(all_feature_names, key=lambda x: x.encode("utf-8")):
-            if fname in (payload.forbiddenFeatures or []):
+            if fname in forbidden_set:
                 continue
+
             is_eligible = True
             for r in retained_rows:
                 feats = r.get("features", {})
                 if fname not in feats:
                     is_eligible = False
                     break
-                # Check availableAt <= predictionTime
-                if feats[fname].get("availableAt", "") > r.get("predictionTime", ""):
+                
+                feat_data = feats[fname]
+                available_at = feat_data.get("availableAt", "")
+                prediction_time = r.get("predictionTime", "")
+
+                # Strict comparison: availableAt <= predictionTime
+                if available_at > prediction_time:
                     is_eligible = False
                     break
+
             if is_eligible:
                 eligible_features.append(fname)
 
-        # Trial filtering & optimization
+        # Trial Selection
         successful_trials = [
-            t
-            for t in (payload.trials or [])
+            t for t in (payload.trials or [])
             if t.get("status") == "SUCCEEDED"
             and isinstance(t.get("evalMetric"), (int, float))
         ]
 
         selected_trial_id = None
         if not successful_trials or "TRIAL_LIMIT_EXCEEDED" in reason_codes:
-            reason_codes.append("NO_SUCCESSFUL_TRIAL")
+            if "NO_SUCCESSFUL_TRIAL" not in reason_codes:
+                reason_codes.append("NO_SUCCESSFUL_TRIAL")
             selected_trial_id = None
         else:
-            # Maximize evalMetric, break ties with smallest integer trialId
             best_trial = max(
                 successful_trials,
                 key=lambda t: (t["evalMetric"], -t["trialId"]),
@@ -140,10 +167,8 @@ async def handle_bqml(payload: BQMLRequest, response: Response):
             "reasonCodes": sorted(list(set(reason_codes)), key=lambda x: x.encode("utf-8")),
         }
 
-        # Idempotency checks
         if run_id in STORAGE:
-            stored_data = STORAGE[run_id]
-            if stored_data != result:
+            if STORAGE[run_id] != result:
                 return Response(
                     content=json.dumps({"error": "RUN_ID_CONFLICT"}),
                     status_code=409,
@@ -161,11 +186,9 @@ async def handle_bqml(payload: BQMLRequest, response: Response):
         eval_reasons = []
         stored = STORAGE.get(run_id)
 
-        # Lineage verification
         if not stored or stored.get("selectedTrialId") != payload.selectedTrialId or stored.get("datasetDigest") != payload.datasetDigest:
             eval_reasons.append("INVALID_LINEAGE")
 
-        # Byte limits check
         if (payload.bytesProcessed or 0) > (payload.maxBytes or 0):
             eval_reasons.append("BYTE_LIMIT")
 
@@ -201,32 +224,25 @@ async def handle_bqml(payload: BQMLRequest, response: Response):
         if rows and not invalid_row_found:
             test_metric = round(total_correct / len(rows), 12)
 
-        # Check required slices
         required_slices = payload.requiredSlices or {}
         missing_slices = [sname for sname in required_slices if sname not in slice_total_counts]
         for ms in missing_slices:
             eval_reasons.append(f"MISSING_SLICE:{ms}")
 
-        slice_floors_failed = []
         for sname, floor in required_slices.items():
             if sname in slice_total_counts and slice_total_counts[sname] > 0:
                 s_acc = slice_correct_counts[sname] / slice_total_counts[sname]
                 if s_acc < floor:
-                    slice_floors_failed.append(sname)
                     eval_reasons.append(f"SLICE_FLOOR:{sname}")
 
-        # Aggregate floor check
         if test_metric is not None and test_metric < (payload.metricFloor or 0.8):
             eval_reasons.append("AGGREGATE_FLOOR")
 
-        # Determine criticalSlicePass
         critical_pass = True
-        if eval_reasons or invalid_row_found or missing_slices or slice_floors_failed:
+        if eval_reasons or invalid_row_found or missing_slices:
             critical_pass = False
 
         decision = "admit" if not eval_reasons and critical_pass else "reject"
-
-        # Unique, sorted reason codes by UTF-8 bytes
         sorted_reasons = sorted(list(set(eval_reasons)), key=lambda x: x.encode("utf-8"))
 
         return {
