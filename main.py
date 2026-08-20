@@ -25,18 +25,19 @@ class BQMLRequest(BaseModel):
     maxBytes: Optional[int] = 2000
 
 
-def parse_utc_time(time_str: str) -> datetime:
-    """Parses various ISO8601 string formats into a UTC datetime object."""
-    if not time_str:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    # Handle Z suffix
-    if time_str.endswith("Z"):
-        time_str = time_str[:-1] + "+00:00"
+def parse_datetime(time_str: str) -> Optional[datetime]:
+    """Parses ISO8601 string formats into a UTC datetime object safely."""
+    if not time_str or not isinstance(time_str, str):
+        return None
     try:
-        return datetime.fromisoformat(time_str).astimezone(timezone.utc)
+        if time_str.endswith("Z"):
+            time_str = time_str[:-1] + "+00:00"
+        dt = datetime.fromisoformat(time_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
     except Exception:
-        # Fallback string comparison if parsing fails
-        return time_str
+        return None
 
 
 @app.post("/bqml")
@@ -65,10 +66,11 @@ async def handle_bqml(payload: BQMLRequest):
         for row in payload.rows or []:
             entity = row.get("entity", "")
             raw_event_time = row.get("eventTime", "")
-            # Normalize eventTime to UTC representation for grouping
-            utc_event_key = parse_utc_time(raw_event_time)
-            
-            key = (entity, utc_event_key)
+            dt_event = parse_datetime(raw_event_time)
+            # Fallback key if parsing fails
+            event_key = dt_event if dt_event else raw_event_time
+
+            key = (entity, event_key)
             ver = row.get("version", 1)
             rid = row.get("id", "")
 
@@ -113,13 +115,21 @@ async def handle_bqml(payload: BQMLRequest):
                     break
                 
                 feat_data = feats[fname]
-                available_at = feat_data.get("availableAt", "")
-                prediction_time = r.get("predictionTime", "")
+                available_at_str = feat_data.get("availableAt", "")
+                prediction_time_str = r.get("predictionTime", "")
 
-                # Strict comparison: availableAt <= predictionTime
-                if available_at > prediction_time:
-                    is_eligible = False
-                    break
+                dt_avail = parse_datetime(available_at_str)
+                dt_pred = parse_datetime(prediction_time_str)
+
+                if dt_avail and dt_pred:
+                    if dt_avail > dt_pred:
+                        is_eligible = False
+                        break
+                else:
+                    # Fallback string comparison
+                    if available_at_str > prediction_time_str:
+                        is_eligible = False
+                        break
 
             if is_eligible:
                 eligible_features.append(fname)
@@ -143,7 +153,6 @@ async def handle_bqml(payload: BQMLRequest):
             )
             selected_trial_id = best_trial["trialId"]
 
-        # Compute datasetDigest via compact JSON SHA-256
         digest_dict = {
             "trainRowIds": train_row_ids,
             "evalRowIds": eval_row_ids,
