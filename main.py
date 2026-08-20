@@ -25,14 +25,15 @@ class BQMLRequest(BaseModel):
     maxBytes: Optional[int] = 2000
 
 
-def parse_datetime(time_str: str) -> Optional[datetime]:
-    """Parses ISO8601 string formats into a UTC datetime object safely."""
+def parse_utc_instant(time_str: str) -> Optional[datetime]:
+    """Strictly parses valid YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm) instants to UTC datetime."""
     if not time_str or not isinstance(time_str, str):
         return None
     try:
-        if time_str.endswith("Z"):
-            time_str = time_str[:-1] + "+00:00"
-        dt = datetime.fromisoformat(time_str)
+        s = time_str.strip()
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
@@ -66,9 +67,9 @@ async def handle_bqml(payload: BQMLRequest):
         for row in payload.rows or []:
             entity = row.get("entity", "")
             raw_event_time = row.get("eventTime", "")
-            dt_event = parse_datetime(raw_event_time)
-            # Fallback key if parsing fails
-            event_key = dt_event if dt_event else raw_event_time
+            dt_event = parse_utc_instant(raw_event_time)
+            # Fallback to string if parsing fails, but prefer parsed UTC datetime object for exact grouping
+            event_key = dt_event if dt_event is not None else raw_event_time
 
             key = (entity, event_key)
             ver = row.get("version", 1)
@@ -97,8 +98,10 @@ async def handle_bqml(payload: BQMLRequest):
         # Feature Eligibility Checks
         all_feature_names = set()
         for r in retained_rows:
-            for fname in r.get("features", {}).keys():
-                all_feature_names.add(fname)
+            feats = r.get("features")
+            if isinstance(feats, dict):
+                for fname in feats.keys():
+                    all_feature_names.add(fname)
 
         eligible_features = []
         forbidden_set = set(payload.forbiddenFeatures or [])
@@ -110,23 +113,27 @@ async def handle_bqml(payload: BQMLRequest):
             is_eligible = True
             for r in retained_rows:
                 feats = r.get("features", {})
-                if fname not in feats:
+                if not isinstance(feats, dict) or fname not in feats:
                     is_eligible = False
                     break
                 
-                feat_data = feats[fname]
-                available_at_str = feat_data.get("availableAt", "")
+                feat_obj = feats[fname]
+                if not isinstance(feat_obj, dict):
+                    is_eligible = False
+                    break
+
+                available_at_str = feat_obj.get("availableAt", "")
                 prediction_time_str = r.get("predictionTime", "")
 
-                dt_avail = parse_datetime(available_at_str)
-                dt_pred = parse_datetime(prediction_time_str)
+                dt_avail = parse_utc_instant(available_at_str)
+                dt_pred = parse_utc_instant(prediction_time_str)
 
-                if dt_avail and dt_pred:
+                if dt_avail is not None and dt_pred is not None:
                     if dt_avail > dt_pred:
                         is_eligible = False
                         break
                 else:
-                    # Fallback string comparison
+                    # Fallback string comparison if parsing fails
                     if available_at_str > prediction_time_str:
                         is_eligible = False
                         break
@@ -137,7 +144,8 @@ async def handle_bqml(payload: BQMLRequest):
         # Trial Selection
         successful_trials = [
             t for t in (payload.trials or [])
-            if t.get("status") == "SUCCEEDED"
+            if isinstance(t, dict)
+            and t.get("status") == "SUCCEEDED"
             and isinstance(t.get("evalMetric"), (int, float))
         ]
 
@@ -215,7 +223,7 @@ async def handle_bqml(payload: BQMLRequest):
                 label = r.get("label")
                 pred = r.get("prediction")
                 s = r.get("slice")
-                if label not in (0, 1) or pred not in (0, 1) or not s:
+                if label not in (0, 1) or pred not in (0, 1) or not s or not isinstance(s, str):
                     invalid_row_found = True
                     eval_reasons.append("INVALID_TEST_ROW")
                     continue
