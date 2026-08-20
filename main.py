@@ -172,9 +172,9 @@ def do_select(data):
     rows = data.get("rows")
     trials = data.get("trials")
 
-    # --------------------------------------------------
+    # ======================================================
     # Top-level validation
-    # --------------------------------------------------
+    # ======================================================
 
     if (
         not isinstance(run_id, str)
@@ -189,7 +189,6 @@ def do_select(data):
     ):
         return invalid_select_response(run_id)
 
-    # Positive integer -- NOT specified as safe integer.
     if (
         not isinstance(limit, int)
         or isinstance(limit, bool)
@@ -203,11 +202,11 @@ def do_select(data):
     if not isinstance(trials, list):
         return invalid_select_response(run_id)
 
-    # --------------------------------------------------
-    # Validate selection rows
-    # --------------------------------------------------
+    # ======================================================
+    # Validate rows
+    # ======================================================
 
-    expected_row_keys = {
+    required_row_fields = {
         "id",
         "entity",
         "eventTime",
@@ -217,20 +216,17 @@ def do_select(data):
         "features",
     }
 
-    expected_feature_keys = {
-        "value",
-        "availableAt",
-    }
-
-    seen_ids = set()
-    validated_rows = []
+    seen_row_ids = set()
+    valid_rows = []
 
     for row in rows:
+
         if not isinstance(row, dict):
             return invalid_select_response(run_id)
 
-        # Exact row shape
-        if set(row.keys()) != expected_row_keys:
+        # Required fields must exist.
+        # Extra fields are harmless.
+        if not required_row_fields.issubset(row.keys()):
             return invalid_select_response(run_id)
 
         rid = row["id"]
@@ -238,12 +234,14 @@ def do_select(data):
         if not isinstance(rid, str):
             return invalid_select_response(run_id)
 
-        if rid in seen_ids:
+        if rid in seen_row_ids:
             return invalid_select_response(run_id)
 
-        seen_ids.add(rid)
+        seen_row_ids.add(rid)
 
-        if not isinstance(row["entity"], str):
+        entity = row["entity"]
+
+        if not isinstance(entity, str):
             return invalid_select_response(run_id)
 
         event_dt = parse_time(row["eventTime"])
@@ -252,10 +250,14 @@ def do_select(data):
         if event_dt is None or prediction_dt is None:
             return invalid_select_response(run_id)
 
-        if not safe_int(row["version"]):
+        version = row["version"]
+
+        if not safe_int(version):
             return invalid_select_response(run_id)
 
-        if row["split"] not in ("TRAIN", "EVAL"):
+        split = row["split"]
+
+        if split not in ("TRAIN", "EVAL"):
             return invalid_select_response(run_id)
 
         features = row["features"]
@@ -263,118 +265,137 @@ def do_select(data):
         if not isinstance(features, dict):
             return invalid_select_response(run_id)
 
-        normalized_features = {}
+        checked_features = {}
 
         for feature_name, feature in features.items():
+
             if not isinstance(feature_name, str):
                 return invalid_select_response(run_id)
 
             if not isinstance(feature, dict):
                 return invalid_select_response(run_id)
 
-            # Exact feature shape
-            if set(feature.keys()) != expected_feature_keys:
+            # These two fields are required.
+            # Extra fields do not invalidate the feature.
+            if (
+                "value" not in feature
+                or "availableAt" not in feature
+            ):
                 return invalid_select_response(run_id)
 
-            available_dt = parse_time(feature["availableAt"])
+            available_dt = parse_time(
+                feature["availableAt"]
+            )
 
             if available_dt is None:
                 return invalid_select_response(run_id)
 
-            # value is deliberately opaque data
-            normalized_features[feature_name] = {
+            checked_features[feature_name] = {
                 "value": feature["value"],
                 "availableAt": available_dt,
             }
 
-        validated_rows.append({
+        valid_rows.append({
             "id": rid,
-            "entity": row["entity"],
+            "entity": entity,
             "eventTime": event_dt,
             "predictionTime": prediction_dt,
-            "version": row["version"],
-            "split": row["split"],
-            "features": normalized_features,
+            "version": version,
+            "split": split,
+            "features": checked_features,
         })
 
-    # --------------------------------------------------
-    # Deduplicate [entity, UTC(eventTime)]
-    # --------------------------------------------------
+    # ======================================================
+    # Deduplicate by [entity, UTC(eventTime)]
+    #
+    # highest version wins
+    # exact version tie -> UTF-8-smallest ID
+    # ======================================================
 
-    groups = {}
+    dedup_groups = {}
 
-    for row in validated_rows:
-        # datetime objects compare/hash by instant when timezone-aware,
-        # but normalize explicitly to UTC for clarity.
-        event_utc = row["eventTime"].astimezone(timezone.utc)
+    for row in valid_rows:
+
+        utc_event = row["eventTime"].astimezone(
+            timezone.utc
+        )
 
         key = (
             row["entity"],
-            event_utc,
+            utc_event,
         )
 
-        groups.setdefault(key, []).append(row)
+        dedup_groups.setdefault(
+            key,
+            []
+        ).append(row)
 
-    retained = []
+    retained_rows = []
 
-    for candidates in groups.values():
-        # highest version first,
-        # then UTF-8-byte-smallest ID
-        candidates.sort(
+    for group in dedup_groups.values():
+
+        winner = min(
+            group,
             key=lambda r: (
                 -r["version"],
                 utf8_key(r["id"]),
             )
         )
 
-        retained.append(candidates[0])
+        retained_rows.append(winner)
 
-    # --------------------------------------------------
-    # Leakage-safe shared features
-    # --------------------------------------------------
+    # ======================================================
+    # Eligible feature intersection
+    # ======================================================
 
-    common_features = set(retained[0]["features"].keys())
+    common_features = set(
+        retained_rows[0]["features"].keys()
+    )
 
-    for row in retained[1:]:
-        common_features.intersection_update(
+    for row in retained_rows[1:]:
+        common_features &= set(
             row["features"].keys()
         )
 
     forbidden_set = set(forbidden)
 
-    eligible_features = []
+    feature_names = []
 
-    for name in common_features:
-        if name in forbidden_set:
+    for feature_name in common_features:
+
+        if feature_name in forbidden_set:
             continue
 
-        eligible = True
+        point_in_time_safe = True
 
-        for row in retained:
-            available_at = row["features"][name]["availableAt"]
+        for row in retained_rows:
+
+            available_at = (
+                row["features"][feature_name]
+                ["availableAt"]
+            )
+
             prediction_time = row["predictionTime"]
 
-            # Point-in-time condition is inclusive.
+            # Inclusive:
+            # availableAt <= predictionTime
             if available_at > prediction_time:
-                eligible = False
+                point_in_time_safe = False
                 break
 
-        if eligible:
-            eligible_features.append(name)
+        if point_in_time_safe:
+            feature_names.append(feature_name)
 
-    feature_names = sorted(
-        eligible_features,
-        key=utf8_key,
-    )
+    feature_names.sort(key=utf8_key)
 
-    # --------------------------------------------------
-    # TRAIN / EVAL IDs after deduplication
-    # --------------------------------------------------
+    # ======================================================
+    # TRAIN / EVAL IDs
+    # ======================================================
 
     train_ids = sorted(
         [
             row["id"]
-            for row in retained
+            for row in retained_rows
             if row["split"] == "TRAIN"
         ],
         key=utf8_key,
@@ -383,7 +404,7 @@ def do_select(data):
     eval_ids = sorted(
         [
             row["id"]
-            for row in retained
+            for row in retained_rows
             if row["split"] == "EVAL"
         ],
         key=utf8_key,
@@ -395,11 +416,11 @@ def do_select(data):
         feature_names,
     )
 
-    # --------------------------------------------------
-    # Trials
-    # --------------------------------------------------
+    # ======================================================
+    # Trial validation
+    # ======================================================
 
-    expected_trial_keys = {
+    required_trial_fields = {
         "trialId",
         "status",
         "evalMetric",
@@ -408,10 +429,13 @@ def do_select(data):
     seen_trial_ids = set()
 
     for trial in trials:
+
         if not isinstance(trial, dict):
             return invalid_select_response(run_id)
 
-        if set(trial.keys()) != expected_trial_keys:
+        if not required_trial_fields.issubset(
+            trial.keys()
+        ):
             return invalid_select_response(run_id)
 
         trial_id = trial["trialId"]
@@ -424,39 +448,64 @@ def do_select(data):
 
         seen_trial_ids.add(trial_id)
 
-        if trial["status"] not in ("SUCCEEDED", "FAILED"):
+        if trial["status"] not in (
+            "SUCCEEDED",
+            "FAILED",
+        ):
             return invalid_select_response(run_id)
+
+    # ======================================================
+    # Contract / trial-selection codes
+    # ======================================================
 
     reason_codes = []
 
     if len(trials) > limit:
-        reason_codes.append("TRIAL_LIMIT_EXCEEDED")
+        reason_codes.append(
+            "TRIAL_LIMIT_EXCEEDED"
+        )
 
-    successful = [
-        trial
-        for trial in trials
+    eligible_trials = []
+
+    for trial in trials:
+
         if (
             trial["status"] == "SUCCEEDED"
-            and finite_number(trial["evalMetric"])
-        )
-    ]
+            and finite_number(
+                trial["evalMetric"]
+            )
+        ):
+            eligible_trials.append(trial)
 
-    if not successful:
-        reason_codes.append("NO_SUCCESSFUL_TRIAL")
+    if not eligible_trials:
+        reason_codes.append(
+            "NO_SUCCESSFUL_TRIAL"
+        )
 
     selected_trial_id = None
 
     if not reason_codes:
+
+        # Max metric;
+        # exact tie -> smallest integer trial ID.
         selected = min(
-            successful,
-            key=lambda trial: (
-                -float(trial["evalMetric"]),
-                trial["trialId"],
+            eligible_trials,
+            key=lambda t: (
+                -float(t["evalMetric"]),
+                t["trialId"],
             ),
         )
 
-        selected_trial_id = selected["trialId"]
+        selected_trial_id = (
+            selected["trialId"]
+        )
 
+    reason_codes = sort_codes(
+        reason_codes
+    )
+
+    # Non-malformed selection has a valid digest even if
+    # TRIAL_LIMIT_EXCEEDED / NO_SUCCESSFUL_TRIAL occurs.
     return {
         "runId": run_id,
         "selectedTrialId": selected_trial_id,
@@ -464,9 +513,7 @@ def do_select(data):
         "evalRowIds": eval_ids,
         "featureNames": feature_names,
         "datasetDigest": digest,
-        "reasonCodes": sort_codes(reason_codes),
-        "datasetDigest": digest,
-        "reasonCodes": sort_codes(reason_codes)
+        "reasonCodes": reason_codes,
     }
 
 
