@@ -26,7 +26,6 @@ class BQMLRequest(BaseModel):
 
 
 def parse_utc_instant(time_str: str) -> Optional[datetime]:
-    """Strictly parses valid YYYY-MM-DDTHH:mm:ss[.sss](Z|±HH:mm) instants to UTC datetime."""
     if not time_str or not isinstance(time_str, str):
         return None
     try:
@@ -38,7 +37,12 @@ def parse_utc_instant(time_str: str) -> Optional[datetime]:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.astimezone(timezone.utc)
     except Exception:
-        return None
+        # Fallback for non-standard formats if any
+        try:
+            dt = datetime.strptime(time_str[:19], "%Y-%m-%dT%H:%M:%S")
+            return dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
 
 
 @app.post("/bqml")
